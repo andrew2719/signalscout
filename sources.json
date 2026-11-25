@@ -1,0 +1,155 @@
+[
+  {
+    "id": "cleveland_clinic",
+    "name": "Cleveland Clinic",
+    "industry": "healthcare",
+    "start_url": "https://newsroom.clevelandclinic.org/news-releases",
+    "allowed_domains": ["newsroom.clevelandclinic.org"],
+    "discovery": {
+      "method": "html",
+      "link_selector": null,
+      "url_pattern": "^https://newsroom\\.clevelandclinic\\.org/\\d{4}/\\d{2}/\\d{2}/[^/]+/?$"
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": ["p.italic.text-rem13px"]
+    },
+    "enabled": true,
+    "notes": "No RSS feed (/feed returns 404). The listing page is server-rendered and article URLs look like /YYYY/MM/DD/slug. robots.txt sets Crawl-delay: 10, which web.py respects. remove_selectors drops the 'for news media use only' notice and image captions. Terms say material 'cannot be reused without permission', so only an excerpt is stored."
+  },
+  {
+    "id": "stanford_medicine",
+    "name": "Stanford Medicine",
+    "industry": "healthcare",
+    "start_url": "https://med.stanford.edu/news.html",
+    "allowed_domains": ["med.stanford.edu"],
+    "discovery": {
+      "method": "html",
+      "link_selector": "a.cmp-teaser__link",
+      "url_pattern": "^https://med\\.stanford\\.edu/news/all-news/\\d{4}/\\d{2}/[^/]+\\.html$"
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": ["div.cmp-mediaContacts"]
+    },
+    "enabled": true,
+    "notes": "No RSS feed or sitemap. all-news.html loads its list with JavaScript, but news.html has a server-rendered 'Latest Articles' list. The selector picks each card's headline link and skips its older 'Related' links. remove_selectors drops the media-contact box, which was otherwise mistaken for the author. robots.txt Crawl-delay: 7. Terms allow personal, non-commercial use only, so only an excerpt is stored."
+  },
+  {
+    "id": "mass_general_brigham",
+    "name": "Mass General Brigham",
+    "industry": "healthcare",
+    "start_url": "https://news.massgeneralbrigham.org/en/sitemap.xml",
+    "allowed_domains": ["massgeneralbrigham.org"],
+    "discovery": {
+      "method": "sitemap",
+      "link_selector": null,
+      "url_pattern": "^https://news\\.massgeneralbrigham\\.org/en/[^/]+$"
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": [],
+      "date_meta": "articlepublishdate"
+    },
+    "enabled": true,
+    "notes": "The homepage list is built with JavaScript (only 4 links in the HTML), but article pages are server-rendered and robots.txt lists a sitemap, so discovery reads the sitemap, newest lastmod first (lastmod only decides which URLs to fetch; it is never used as a date). Pages declare canonical URLs on www.massgeneralbrigham.org, hence the parent domain. Dates come from the 'articlepublishdate' meta tag: the generic 'published-time' tag is the CMS re-publish time (e.g. 2026-09-03 for an article written 2026-05-20), so pages without articlepublishdate get no date. Image captions sometimes appear in the text: the obvious selector for them (div.body-copy-inline-media) also wraps real body text, so it is deliberately not used. Terms allow personal, non-commercial use only, so only an excerpt is stored."
+  },
+  {
+    "id": "intermountain_health",
+    "name": "Intermountain Health",
+    "industry": "healthcare",
+    "start_url": "https://news.intermountainhealth.org/feed/",
+    "allowed_domains": ["news.intermountainhealth.org"],
+    "discovery": {
+      "method": "rss",
+      "link_selector": null,
+      "url_pattern": null
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": []
+    },
+    "enabled": true,
+    "notes": "Replacement for a blocked source. Public RSS feed with about 25 items, allowed by robots.txt (Crawl-delay: 5). Terms require permission to reproduce articles, so only an excerpt is stored."
+  },
+  {
+    "id": "vanderbilt_health",
+    "name": "Vanderbilt University Medical Center",
+    "industry": "healthcare",
+    "start_url": "https://news.vumc.org/feed/",
+    "allowed_domains": ["news.vumc.org"],
+    "discovery": {
+      "method": "rss",
+      "link_selector": null,
+      "url_pattern": null
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": []
+    },
+    "enabled": true,
+    "notes": "Replacement for a blocked source. Public RSS feed with about 20 items, allowed by robots.txt. No explicit reuse permission found, so only an excerpt is stored."
+  },
+  {
+    "id": "mayo_clinic",
+    "name": "Mayo Clinic",
+    "industry": "healthcare",
+    "start_url": "https://newsnetwork.mayoclinic.org/category/news-releases-2/",
+    "allowed_domains": ["newsnetwork.mayoclinic.org"],
+    "discovery": {
+      "method": "html",
+      "link_selector": null,
+      "url_pattern": null
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": []
+    },
+    "enabled": false,
+    "notes": "Disabled: returns HTTP 403 'Access Denied' to automated requests for every URL, including its feeds and robots.txt (checked 2026-11-24). Not bypassed."
+  },
+  {
+    "id": "johns_hopkins_medicine",
+    "name": "Johns Hopkins Medicine",
+    "industry": "healthcare",
+    "start_url": "https://www.hopkinsmedicine.org/news/newsroom/news-releases",
+    "allowed_domains": ["hopkinsmedicine.org"],
+    "discovery": {
+      "method": "html",
+      "link_selector": null,
+      "url_pattern": null
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": []
+    },
+    "enabled": false,
+    "notes": "Disabled: the newsroom answers automated requests with a Cloudflare JavaScript challenge ('Just a moment...', HTTP 403), checked 2026-11-24. Not bypassed."
+  },
+  {
+    "id": "unc_health",
+    "name": "UNC Health",
+    "industry": "healthcare",
+    "start_url": "https://news.unchealthcare.org/feed/",
+    "allowed_domains": ["news.unchealthcare.org"],
+    "discovery": {
+      "method": "rss",
+      "link_selector": null,
+      "url_pattern": null
+    },
+    "extraction": {
+      "method": "auto",
+      "content_scope": "excerpt",
+      "remove_selectors": []
+    },
+    "enabled": false,
+    "notes": "Disabled: the RSS feed is public, but article pages return a 403 'Checking connection...' bot challenge (checked 2026-11-24). Not bypassed."
+  }
+]
