@@ -1,4 +1,9 @@
-"""MongoDB Atlas helpers: connect, create indexes, save articles, keyword search."""
+"""MongoDB Atlas helpers.
+
+Write side, used only by ingest.py:  ensure_indexes, save_article.
+Read side, used by search.py and the MCP server:  search_articles, find_by_tags, find_by_source,
+find_published_since, count_without_date, source_stats. These functions only read.
+"""
 import os
 from datetime import datetime
 from pathlib import Path
@@ -9,11 +14,19 @@ from pymongo.collection import Collection
 
 DB_NAME = "signalscout"
 COLLECTION_NAME = "articles"
-ENV_FILE = Path(__file__).parent / ".env"  # explicit path so cron jobs work from any directory
+ENV_FILE = Path(__file__).parent / ".env"  # explicit path so cron jobs work from any directory; optional on Render
+QUERY_TIMEOUT_MS = 5_000  # server-side time limit (maxTimeMS) for every read query
+# The fields a reader needs. MongoDB ids, hashes and ingestion timestamps stay in the database.
+ARTICLE_FIELDS = {"_id": 0, "title": 1, "source.id": 1, "source.name": 1, "published_date": 1,
+                  "description": 1, "content": 1, "content_scope": 1, "tags": 1, "canonical_url": 1}
 
 
 def get_client() -> MongoClient:
-    """Create a MongoDB client from MONGODB_URI in .env (the URI is never printed)."""
+    """Create a MongoDB client from MONGODB_URI (the URI is never printed).
+
+    Locally the value comes from .env; on Render it is a normal environment variable and no
+    .env file exists (load_dotenv just does nothing). A real environment variable wins over .env.
+    """
     load_dotenv(ENV_FILE)
     uri = os.getenv("MONGODB_URI")
     if not uri:
@@ -72,15 +85,57 @@ def save_article(collection: Collection, article: dict, now: datetime) -> str:
     return status
 
 
+# --- Read side -------------------------------------------------------------------------------
+
 def search_articles(collection: Collection, query: str, limit: int = 5) -> list[dict]:
-    """Keyword search with the text index, best matches first."""
-    projection = {"_id": 0, "score": {"$meta": "textScore"}, "title": 1, "canonical_url": 1,
-                  "published_date": 1, "source.name": 1, "description": 1, "tags": 1}
+    """Keyword search with the text index (title, description, excerpt), best matches first."""
+    projection = {**ARTICLE_FIELDS, "score": {"$meta": "textScore"}}
     cursor = collection.find({"$text": {"$search": query}}, projection)
-    return list(cursor.sort([("score", {"$meta": "textScore"})]).limit(limit))
+    return list(cursor.sort([("score", {"$meta": "textScore"})]).limit(limit).max_time_ms(QUERY_TIMEOUT_MS))
 
 
-def count_by_source(collection: Collection) -> list[dict]:
-    """Number of stored documents per source, largest first."""
-    pipeline = [{"$group": {"_id": "$source.id", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
-    return list(collection.aggregate(pipeline))
+def find_by_tags(collection: Collection, tags: list[str], limit: int) -> list[dict]:
+    """Articles carrying any of the given keyword tags, newest publication date first."""
+    cursor = collection.find({"tags": {"$in": tags}}, ARTICLE_FIELDS)
+    return list(cursor.sort([("published_date", DESCENDING)]).limit(limit).max_time_ms(QUERY_TIMEOUT_MS))
+
+
+def find_by_source(collection: Collection, source_id: str, limit: int) -> list[dict]:
+    """One source's articles, newest publication date first (articles without a date sort last)."""
+    cursor = collection.find({"source.id": source_id}, ARTICLE_FIELDS)
+    return list(cursor.sort([("published_date", DESCENDING)]).limit(limit).max_time_ms(QUERY_TIMEOUT_MS))
+
+
+def find_published_since(collection: Collection, since: str, limit: int) -> list[dict]:
+    """Articles published on or after `since` (YYYY-MM-DD), newest first.
+
+    Dates are stored as "YYYY-MM-DD" strings, which compare correctly as text. Articles with an
+    unknown (null) publication date never match a string comparison, so they are excluded.
+    """
+    cursor = collection.find({"published_date": {"$gte": since}}, ARTICLE_FIELDS)
+    return list(cursor.sort([("published_date", DESCENDING)]).limit(limit).max_time_ms(QUERY_TIMEOUT_MS))
+
+
+def count_without_date(collection: Collection) -> int:
+    """Number of articles whose publication date is unknown."""
+    return collection.count_documents({"published_date": None}, maxTimeMS=QUERY_TIMEOUT_MS)
+
+
+def source_stats(collection: Collection) -> list[dict]:
+    """Per-source article counts, publication-date range and collection times, largest source first.
+
+    `_id` is the source id. $min/$max ignore articles without a publication date.
+    """
+    pipeline = [
+        {"$group": {
+            "_id": "$source.id",
+            "organization": {"$first": "$source.name"},
+            "article_count": {"$sum": 1},
+            "earliest_published_date": {"$min": "$published_date"},
+            "latest_published_date": {"$max": "$published_date"},
+            "first_collected_at": {"$min": "$first_seen_at"},
+            "latest_fetch_at": {"$max": "$last_fetched_at"},
+        }},
+        {"$sort": {"article_count": -1, "_id": 1}},
+    ]
+    return list(collection.aggregate(pipeline, maxTimeMS=QUERY_TIMEOUT_MS))

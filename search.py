@@ -1,6 +1,6 @@
-"""Keyword search over the stored articles (MongoDB text index).
+"""Keyword search over the stored articles (MongoDB text index only).
 
-This is the same query a future MCP tool would run for Claude.
+The MCP server's search_articles tool builds on the same query and adds synonyms and tag matching.
 
   conda run -n ml python search.py "artificial intelligence"
   conda run -n ml python search.py partnership --limit 10
@@ -11,7 +11,7 @@ import sys
 
 from pymongo.errors import PyMongoError
 
-from database import count_by_source, get_collection, search_articles
+from database import get_collection, search_articles, source_stats
 
 
 def main() -> int:
@@ -26,10 +26,10 @@ def main() -> int:
     try:
         collection = get_collection()
         if args.stats:
-            rows = count_by_source(collection)
+            rows = source_stats(collection)
             for row in rows:
-                print(f"{row['_id']:<26}{row['count']:>5}")
-            print(f"{'total':<26}{sum(row['count'] for row in rows):>5}")
+                print(f"{row['_id']:<26}{row['article_count']:>5}")
+            print(f"{'total':<26}{sum(row['article_count'] for row in rows):>5}")
         if args.query:
             results = search_articles(collection, args.query, args.limit)
             print(f"{len(results)} result(s) for {args.query!r}\n")

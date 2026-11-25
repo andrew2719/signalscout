@@ -1,9 +1,12 @@
 # SignalScout
 
-SignalScout is a small **commercial-intelligence ingestion pipeline**. Every day it collects recent news
-articles from organizations' public newsrooms, turns each one into the same validated document format,
-and stores it in MongoDB Atlas without creating duplicates. The next step (not built yet) is a lightweight
-MCP server so Claude can search these documents.
+SignalScout is a small **commercial-intelligence pipeline with a Claude connector**:
+
+1. An **ingestion pipeline** (runs daily on a laptop) collects recent news articles from organizations'
+   public newsrooms, turns each one into the same validated document format, and stores it in MongoDB
+   Atlas without creating duplicates.
+2. A read-only **MCP server** (hosted on Render) lets Claude search those articles through four tools and cite
+   the original sources.
 
 It's a student portfolio project: plain synchronous Python, a handful of files, no frameworks.
 Working, simple and explainable came before clever.
@@ -25,7 +28,28 @@ SignalScout:
 Healthcare organizations are the demo dataset, but nothing in the code is healthcare-specific.
 A new website is usually just a new entry in `sources.json`.
 
-## How the pipeline works
+## Architecture
+
+```text
+ Laptop (daily cron)                     MongoDB Atlas                     Render (free web service)
+┌──────────────────────┐   write user   ┌──────────────────────┐  read-only  ┌───────────────────────┐
+│ ingest.py            │ ─────────────► │ signalscout.articles │ ◄────────── │ server.py (MCP)       │
+│ discover → fetch →   │  upsert by     │ 79 articles, indexes │    user     │ 4 read-only tools     │
+│ extract → validate   │  canonical_url └──────────────────────┘             │ /mcp  and  /health    │
+└──────────────────────┘                                                     └───────────▲───────────┘
+                                                                                         │ HTTPS (Streamable HTTP)
+                                                                             ┌───────────┴───────────┐
+                                                                             │ Claude (connector)    │
+                                                                             │ summarises, reasons,  │
+                                                                             │ cites source URLs     │
+                                                                             └───────────────────────┘
+```
+
+The two halves only meet in the database. The laptop holds the write credentials and runs ingestion; the
+MCP server only reads, with a separate read-only database user, and never runs ingestion. Claude does the
+summarising and commercial reasoning; the server only retrieves data.
+
+The ingestion pipeline in detail:
 
 ```text
 sources.json      per-site settings: start URL, discovery method, selectors, content scope
@@ -54,11 +78,15 @@ database.py       upsert by canonical_url into MongoDB Atlas (signalscout.articl
 | `discover.py` | Turns a source's start page into a list of article URLs: `rss` (feedparser), `html` (links on a listing page, optional CSS selector) or `sitemap` (newest `lastmod` first). Filters by domain, URL pattern and file type, removes duplicates, applies the per-source limit. |
 | `extract.py` | Turns article HTML into title, text, description, date, author, language and canonical URL. Trafilatura does the generic work; BeautifulSoup handles canonical URL, language, fallbacks and per-site `remove_selectors`. Rejects empty pages, bot-check pages and stubs. |
 | `models.py` | The `Article` Pydantic model (the common format), plus helpers: excerpt creation, SHA-256 content hash and simple keyword tags. |
-| `database.py` | MongoDB connection, idempotent index creation, the insert/update logic and keyword search. |
+| `database.py` | MongoDB connection, plus a write side used only by ingestion (idempotent indexes, insert/update logic) and a read side used by the MCP server (search, tag, source, date and coverage queries, each with a 5 s time limit). |
 | `ingest.py` | The command-line pipeline: runs everything above, writes the JSON export, saves to MongoDB and prints a summary. |
-| `search.py` | Keyword search and per-source counts over the stored documents (the query a future MCP tool would run). |
+| `search.py` | Command-line keyword search (plain MongoDB text search) and per-source counts. |
+| `server.py` | The MCP server: four read-only tools, the `/health` endpoint and the Render settings (port, host validation). |
+| `check_mcp.py` | Calls every MCP tool through a real MCP client, against the local or the deployed server. |
 | `test_connection.py` | Pings MongoDB Atlas and explains common failures (DNS, authentication, IP access list). |
-| `tests/test_pipeline.py` | pytest tests (offline), plus one opt-in test against a separate Atlas collection. |
+| `tests/test_pipeline.py` | pytest tests for the pipeline (offline), plus one opt-in test against a separate Atlas collection. |
+| `tests/test_server.py` | pytest tests for the MCP server (offline, through an in-memory MCP client), plus two opt-in tests with real data. |
+| `.python-version` | The Python version Render uses (3.12). |
 
 ## Supported sources
 
@@ -99,11 +127,14 @@ pip, constrained so that **no package already in the environment was upgraded or
 conda run -n ml python -m pip install -r requirements.txt
 ```
 
-### Environment variables (`.env`)
+### Environment variables
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `MONGODB_URI` | yes | Atlas connection string, `mongodb+srv://<username>:<password>@<cluster>.mongodb.net/`. The only variable the code reads. |
+| `MONGODB_URI` | yes | Atlas connection string, `mongodb+srv://<username>:<password>@<cluster>.mongodb.net/`. Locally it comes from `.env` (the read-write user, for ingestion); on Render it is set in the dashboard (the read-only user). A real environment variable takes priority over `.env`. |
+| `PORT` | no | Port for `server.py`; default 8000. Render sets it. |
+| `RENDER_EXTERNAL_HOSTNAME` | no | Set by Render to the service's `onrender.com` hostname; `server.py` adds it to the allowed hosts. |
+| `SIGNALSCOUT_DB_TESTS` | no | Set to `1` to run the opt-in tests against Atlas. |
 | `MONGODB_USERNAME`, `MONGODB_PASSWORD` | no | Created by the Atlas onboarding download. Not used, since the URI already contains them. |
 
 `.env` is listed in `.gitignore` and must never be committed; `.env.example` shows the format.
@@ -276,21 +307,214 @@ sources only allow storing an excerpt.
 3. Try it: `conda run -n ml python ingest.py --source example_org --dry-run --limit 5`, then compare
    `output/articles.json` with the real pages.
 
-## Testing
+## The MCP server (Claude connector)
 
-`conda run -n ml python -m pytest -v` runs 43 offline test cases (no network, no database; the opt-in Atlas
-test below shows as skipped) covering URL normalization, domain checks, duplicate URLs, RSS/HTML/sitemap
-discovery, extraction from a saved HTML fixture, site-specific date tags, missing optional metadata,
-empty/bot-check pages, Pydantic validation, excerpts, content-hash
-consistency, keyword tags, the MongoDB insert/update logic (with a mocked collection) and the HTTP retry rules.
-The fixture in `tests/fixtures/article.html` is fictional, so no copyrighted page is stored in the repo.
+`server.py` exposes four **read-only** tools over MCP's Streamable HTTP transport at `/mcp`, built with the
+official MCP Python SDK (`mcp==2.3.0`, where the high-level server class is `MCPServer`):
 
-One opt-in test runs the same insert/update rules against Atlas, using a separate collection
-(`articles_test`) that it drops afterwards:
+| Tool | What it returns |
+|---|---|
+| `search_articles(query, limit=10)` | Articles matching keywords or a topic: MongoDB text search over titles, descriptions and excerpts **plus** the keyword tags assigned at ingestion, with simple synonyms (AI / artificial intelligence / machine learning, expansion / expand, partnership / partner / joint venture, acquisition / merger, investment / funding). |
+| `get_organization_news(organization, limit=10)` | One organization's newest articles. Accepts a name, source id or initials in any case (`Cleveland Clinic`, `cleveland_clinic`, `MGB`); an unknown name returns the list of available organizations. |
+| `get_recent_articles(days=30, limit=10)` | Articles **published** in the last N days across all sources, by publication date (not ingestion time). Articles without a known date are excluded. |
+| `get_data_coverage()` | Total articles, organizations with per-source counts and date ranges, the latest publication date, the latest successful fetch, and a plain statement of what the data does not cover. |
+
+Every article comes back in the same JSON shape, always with its source URL so Claude can cite it
+(fictional example):
+
+```json
+{
+  "title": "Example Health Opens AI-Assisted Imaging Center",
+  "organization": "Example Health",
+  "source_id": "example_health",
+  "published_date": "2026-11-20",
+  "description": "The new center uses machine learning tools to help radiologists review urgent scans faster.",
+  "excerpt": "SPRINGFIELD — Example Health today opened a new imaging center ...",
+  "content_scope": "excerpt",
+  "tags": ["ai", "expansion"],
+  "url": "https://news.example-health.org/2026/11/20/ai-imaging-center",
+  "matched_by": ["text", "tags"]
+}
+```
+
+`matched_by` appears only in search results. MongoDB ids, content hashes and ingestion timestamps are never
+returned. Each response is both structured content and a JSON text copy.
+
+**How search works.** The query is reduced to plain words and matched against a small synonym table to find
+topics. Then two queries run: a MongoDB text search for the words plus single-word synonyms (`expansion` also
+searches `expand`, which the stemmer treats as a different word), and a tag query for the topics (which finds
+AI articles even when the stored excerpt never says "AI"). Text matches come first, in MongoDB's own relevance
+order, then tag-only matches. Duplicates are removed by URL, `matched_by` says why each article was returned,
+and no relevance scores are invented. Measured on the real data (79 articles, limit 20):
+
+| Query | Plain MongoDB text search | `search_articles` tool |
+|---|---|---|
+| AI | 0 | 2 |
+| artificial intelligence | 1 | 2 |
+| expansion | 0 | 15 |
+| partnership | 3 | 7 |
+| investment | 3 | 11 |
+| acquisition | 1 | 2 |
+| automation | 0 | 0 (no article mentions it) |
+
+**Safety and limits.**
+
+- **Read-only.** The server only runs `find`, `aggregate` and `count_documents`. It never inserts, updates,
+  deletes or creates indexes (a test records every command it sends to MongoDB), and it is meant to run with a
+  read-only database user.
+- **No authentication.** This is a public demonstration endpoint serving permitted public information
+  (titles, short excerpts, links). Anyone who knows the URL can call the tools. Don't point it at private data.
+- **User input never becomes a MongoDB query.** Search text is reduced to plain words (quotes, minus signs and
+  operators removed), organization names are matched against the known list, and numbers are validated (limit
+  1–20, days 1–365, query up to 200 characters). Every database query has a 5-second time limit (`maxTimeMS`).
+- **Webpage content is untrusted.** Every response, and the server's MCP instructions, tell Claude to treat
+  titles, descriptions and excerpts as data to analyse and cite, not as instructions.
+- **Errors don't leak internals.** A database problem returns "The article database is temporarily
+  unavailable"; connection details stay in the server log, and credentials are never logged.
+- **Host validation.** `/mcp` only accepts requests addressed to localhost or the Render hostname
+  (`RENDER_EXTERNAL_HOSTNAME`, set by Render); anything else gets HTTP 421 (protection against DNS rebinding).
+  `/health` has no such check, so Render's health checker always reaches it.
+- **Resilient startup.** One MongoDB client per process, created at the first tool call. A MongoDB outage never
+  stops the HTTP server from starting, and the next tool call retries.
+
+**Run it locally.**
 
 ```bash
-SIGNALSCOUT_DB_TESTS=1 conda run -n ml python -m pytest -v -k real_mongodb
+conda run -n ml python server.py      # MCP endpoint http://localhost:8000/mcp, MONGODB_URI from .env
+curl http://localhost:8000/health     # {"status":"ok"}
+conda run -n ml python check_mcp.py   # in a second terminal: lists and calls all four tools
 ```
+
+`conda run` shows the server log only when it stops; use `conda run --no-capture-output ...` to see it live.
+The server listens on `0.0.0.0` (Render needs that), but host validation only accepts requests addressed to
+localhost.
+
+To try the read-only user locally before deploying (the connection string is not echoed or saved in your shell
+history; an environment variable takes priority over `.env`):
+
+```bash
+read -rs MONGODB_URI && export MONGODB_URI     # paste the read-only connection string, press Enter
+conda run -n ml python server.py
+```
+
+## Deploying to Render
+
+### 1. Create a read-only MongoDB user
+
+In Atlas: **Security → Database & Network Access → Database Users → Add New Database User**.
+
+- Authentication method **Password**; username for example `signalscout_reader`; **Autogenerate Secure Password**.
+- Privileges: expand **Specific Privileges**, add role **`read`** on database **`signalscout`**, and remove the
+  default built-in role. (If your cluster doesn't offer specific privileges, use the built-in role
+  **Only read any database**.)
+- Optionally **Restrict Access to Specific Clusters** to this cluster.
+
+Its connection string is the one from **Connect → Drivers**, with this user's name and password. The laptop's
+`.env` keeps the existing read-write user for ingestion.
+
+### 2. Create the web service
+
+Render dashboard → **New → Web Service** → connect the GitHub repository:
+
+| Setting | Value |
+|---|---|
+| Service type | Web Service |
+| Repository / branch | `andrew2719/signalscout` / `main` |
+| Runtime | Python (version from `.python-version`: 3.12) |
+| Instance type | Free |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `python server.py` |
+| Health check path | `/health` |
+| Environment variable | `MONGODB_URI` = the read-only connection string |
+
+Render sets `PORT` (the server listens on it; local default 8000) and `RENDER_EXTERNAL_HOSTNAME` (added to the
+allowed hosts) by itself. No `.env` file, disk, Docker image or background worker is used, and Render never
+runs `ingest.py`. `requirements.txt` pins the versions tested locally; a pip dry run confirmed that all of them
+install on Linux with Python 3.12 from prebuilt wheels.
+
+### 3. Allow Render's outbound IPs in Atlas
+
+Atlas only accepts connections from listed addresses. In Render, open the service → **Connect** (top right) →
+**Outbound** tab and copy the IP ranges (they are shared by all Render services in the region). In Atlas →
+**Security → Database & Network Access → IP Access List → Add IP Address**, add each range. Allowing
+`0.0.0.0/0` (anywhere) also works but lets any address attempt to log in; only consider it with the read-only
+user.
+
+### 4. Verify the deployment
+
+```bash
+curl https://<your-service>.onrender.com/health
+conda run -n ml python check_mcp.py https://<your-service>.onrender.com/mcp
+```
+
+If a tool says "temporarily unavailable", check the service's logs on Render: usually the Atlas IP access list
+or the `MONGODB_URI` value.
+
+**Free tier.** The service sleeps after 15 minutes without traffic and takes about a minute to wake, so the
+first request after a pause is slow (open `/health` first) and may time out once. Free instances share a
+monthly allowance of 750 instance hours per workspace.
+
+## Connecting Claude
+
+**Claude (web and desktop):** Customize → Connectors → **+ Add** → **Add custom connector** → name
+`SignalScout`, URL `https://<your-service>.onrender.com/mcp` → Authentication **No sign in** → Add, then enable
+it in a chat. Custom connectors work on Free (one connector), Pro, Max, Team and Enterprise plans; on Team and
+Enterprise an owner adds it under Organization settings → Connectors. Claude connects from Anthropic's cloud,
+so the server must be public, which it is on Render.
+
+**Claude Code:**
+
+```bash
+claude mcp add --transport http signalscout https://<your-service>.onrender.com/mcp
+claude mcp list    # shows ✔ Connected when it works
+```
+
+**Example commercial-intelligence questions:**
+
+- "Using SignalScout, which healthcare organizations announced partnerships or joint ventures recently? Cite
+  the sources."
+- "What has Cleveland Clinic announced in the last month that a medical-technology vendor should know about?"
+- "Find news about AI adoption at these health systems and summarise who is doing what."
+- "Which organizations are expanding (new facilities, acquisitions, investments)? List them with dates and links."
+- "What does the SignalScout database cover, and how recent is it?"
+
+## Testing
+
+`conda run -n ml python -m pytest -v` runs 75 offline test cases (no network, no database; the 3 opt-in tests
+below show as skipped):
+
+- `tests/test_pipeline.py` (43): URL normalization, domain checks, duplicate URLs, RSS/HTML/sitemap discovery,
+  extraction from a saved HTML fixture, site-specific date tags, missing optional metadata, empty/bot-check
+  pages, Pydantic validation, excerpts, content-hash consistency, keyword tags, the MongoDB insert/update logic
+  (with a mocked collection) and the HTTP retry rules. The fixture in `tests/fixtures/article.html` is
+  fictional, so no copyrighted page is stored in the repo.
+- `tests/test_server.py` (32): query cleaning, synonym/topic detection, merging and de-duplication, the article
+  shape (JSON-serializable, no internal fields), organization matching, all four tools through a real in-memory
+  MCP client (results, empty results, invalid arguments, a database outage without leaked details), read-only
+  database access, the `/health` endpoint and host validation.
+
+Three opt-in tests use MongoDB Atlas:
+
+```bash
+SIGNALSCOUT_DB_TESTS=1 conda run -n ml python -m pytest -v
+```
+
+- the insert/update rules on a separate `articles_test` collection that is dropped afterwards;
+- a real `server.py` process queried by a real MCP client over HTTP: real records, source URLs, tags beating
+  plain text search, empty results, and a collection snapshot that is identical before and after;
+- a recorder of every MongoDB command the four tools send, which must contain no writes.
+
+### MCP server checks (2026-11-24, local server, real Atlas data)
+
+| Check | Result |
+|---|---|
+| Real MCP client (`check_mcp.py`, Streamable HTTP) | Lists 4 tools; all calls succeed with real articles, each with its source URL. |
+| Coverage | 79 articles, 5 organizations, published 2026-06-09 to 2026-11-24, latest fetch 2026-11-25 02:29 UTC. |
+| Tags and synonyms | See the table above: `AI` 0 → 2 and `expansion` 0 → 15 compared with plain text search. |
+| Edge cases | Blank query, `limit` 50 and `days` 0 return clear tool errors; an unknown organization lists the available ones; `MGB` resolves to Mass General Brigham; a nonsense query returns 0 articles with a hint. |
+| No writes | The command recorder saw only `find`, `aggregate` and the login handshake; the collection snapshot (every document's hash and fetch time, plus the index list) was unchanged. |
+| HTTP | `/health` returns 200 for any Host header; `/mcp` returns 200 for `localhost` and the Render hostname and 421 for a foreign Host. |
+| Render dependencies | `pip install --dry-run` for Linux / CPython 3.12 resolves every pinned package from prebuilt wheels. |
 
 ### Integration checks on the real sites and Atlas (2026-11-24)
 
@@ -357,8 +581,9 @@ SignalScout can't guarantee complete history after a long gap. (`anacron` or a s
   not the full article. Tags are computed from a longer lead, so a document can be tagged `ai` without the word
   appearing in its stored text. To find topics, query the `tags` field as well as the text.
 - **Keyword search is stemmed, not semantic.** MongoDB's English stemmer turns "expansion" into *expans* and
-  "expands" into *expand*, so a search for `expansion` doesn't find "expands" (search `expand` instead).
-  Synonyms (AI vs. "machine learning") aren't matched either.
+  "expands" into *expand*, so plain text search (`search.py`) for `expansion` doesn't find "expands". The MCP
+  tool covers this with a small, fixed synonym table and the tags, but it has no real semantic understanding,
+  and a query with several topics returns articles matching any of them (each result lists its tags).
 - **Dates are taken as the page writes them.** Intermountain's JSON-LD writes times with a +01:00 offset, so a
   post from 17:30 Mountain Time on Oct 27 is stored as Oct 28 (1 of 20 Intermountain articles checked against
   the RSS feed). MGB articles without an `articlepublishdate` tag have no date.
@@ -377,16 +602,13 @@ SignalScout can't guarantee complete history after a long gap. (`anacron` or a s
   daily job.
 - **Not production-grade.** No monitoring, alerting, job queue or concurrency control. Two runs at the same
   time could race (the unique index still prevents duplicate documents).
-
-## Next step: MCP integration
-
-The pipeline is ready to sit behind an MCP server. The plan:
-
-- A small Python MCP server (hosted on Render) that imports `database.py` and exposes a few read-only tools,
-  e.g. `search_articles(query, limit)` (already implemented as the MongoDB text search used by `search.py`),
-  `recent_articles(source_id, since)` (uses the `source.id` and `published_date` indexes) and
-  `get_article(canonical_url)`.
-- Claude gets titles, descriptions, excerpts, tags and links, and can cite and open the original article.
-- Retrieved text is untrusted web content, so the server should label it as data, not instructions.
-- The daily ingestion keeps running separately (cron), and Atlas Network Access must also allow Render's
-  outbound IPs.
+- **Small dataset.** 79 articles from 5 healthcare newsrooms, collected since 2026-11-24, growing only as fast
+  as the daily runs on the laptop. `get_data_coverage` states this so Claude doesn't overgeneralise.
+- **Public MCP endpoint without authentication.** Anyone with the URL can query it. That's acceptable only
+  because it serves public, permitted information through a read-only database user.
+- **Free-tier hosting.** Cold starts of about a minute after 15 idle minutes, a single instance, and a monthly
+  hour allowance. Render's outbound IP ranges are shared, so the Atlas allowlist admits all Render services
+  in that region (they still need the password).
+- **Local Python vs. Render Python.** Everything was tested in the `ml` environment (Python 3.10); Render runs
+  Python 3.12. The code uses nothing version-specific and the pinned dependencies resolve for 3.12, but the
+  deployment itself has to be verified once it's live (Deploying to Render → step 4).
